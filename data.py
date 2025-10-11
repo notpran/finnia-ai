@@ -9,7 +9,9 @@ from transformers import PreTrainedTokenizerBase
 
 CHAT_DATASET_NAME = "OpenAssistant/oasst1"
 MATH_DATASET_NAME = "gsm8k"
+MATH_DATASET_CONFIG = "main"
 CODE_DATASET_NAME = "fka/CodeAlpaca-20k"
+CODE_DATASET_CONFIG = None
 
 
 @dataclass
@@ -59,7 +61,7 @@ def _load_chat_dataset(split: str, sample_size: Optional[int] = None) -> Dataset
 
 
 def _load_math_dataset(split: str, sample_size: Optional[int] = None) -> Dataset:
-    raw = load_dataset(MATH_DATASET_NAME, split=split)
+    raw = load_dataset(MATH_DATASET_NAME, MATH_DATASET_CONFIG, split=split)
 
     def generator() -> Iterable[str]:
         for row in raw:
@@ -80,7 +82,10 @@ def _load_math_dataset(split: str, sample_size: Optional[int] = None) -> Dataset
 
 
 def _load_code_dataset(split: str, sample_size: Optional[int] = None) -> Dataset:
-    raw = load_dataset(CODE_DATASET_NAME, split=split)
+    load_kwargs = {"split": split}
+    if CODE_DATASET_CONFIG:
+        load_kwargs["name"] = CODE_DATASET_CONFIG
+    raw = load_dataset(CODE_DATASET_NAME, **load_kwargs)
 
     def generator() -> Iterable[str]:
         for row in raw:

@@ -5,6 +5,8 @@ import os
 from dataclasses import asdict
 
 import torch
+from inspect import signature
+
 from transformers import DataCollatorForLanguageModeling, Trainer, TrainingArguments
 
 from data import DataConfig, load_mixed_dataset
@@ -60,27 +62,38 @@ def main() -> None:
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        overwrite_output_dir=args.overwrite_output_dir,
-        evaluation_strategy="no" if args.no_eval else args.evaluation_strategy,
-        save_strategy=args.save_strategy,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        per_device_train_batch_size=args.train_batch_size,
-        per_device_eval_batch_size=args.eval_batch_size,
-        num_train_epochs=args.epochs,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        logging_steps=args.logging_steps,
-        fp16=fp16 and not bf16,
-        bf16=bf16,
-        report_to=["tensorboard"],
-        load_best_model_at_end=not args.no_eval,
-        save_total_limit=2,
-        push_to_hub=False,
-        gradient_checkpointing=True,
-    )
+    raw_args = {
+        "output_dir": args.output_dir,
+        "overwrite_output_dir": args.overwrite_output_dir,
+        "evaluation_strategy": "no" if args.no_eval else args.evaluation_strategy,
+        "save_strategy": args.save_strategy,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "per_device_train_batch_size": args.train_batch_size,
+        "per_device_eval_batch_size": args.eval_batch_size,
+        "num_train_epochs": args.epochs,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "warmup_steps": args.warmup_steps,
+        "logging_steps": args.logging_steps,
+        "fp16": fp16 and not bf16,
+        "bf16": bf16,
+        "report_to": ["tensorboard"],
+        "load_best_model_at_end": not args.no_eval,
+        "save_total_limit": 2,
+        "push_to_hub": False,
+        "gradient_checkpointing": True,
+    }
+
+    supported_params = set(signature(TrainingArguments.__init__).parameters)
+    filtered_args = {k: v for k, v in raw_args.items() if k in supported_params}
+
+    if "evaluation_strategy" not in supported_params and not args.no_eval:
+        # Transformers<3.1 used `evaluate_during_training` instead.
+        filtered_args["evaluate_during_training"] = True
+    if "save_strategy" not in supported_params:
+        filtered_args.pop("save_strategy", None)
+
+    training_args = TrainingArguments(**filtered_args)
 
     trainer = Trainer(
         model=model,

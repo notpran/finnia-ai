@@ -10,7 +10,7 @@ from transformers import PreTrainedTokenizerBase
 CHAT_DATASET_NAME = "OpenAssistant/oasst1"
 MATH_DATASET_NAME = "gsm8k"
 MATH_DATASET_CONFIG = "main"
-CODE_DATASET_NAME = "fka/CodeAlpaca-20k"
+CODE_DATASET_NAME = "sahil2801/CodeAlpaca-20k"
 CODE_DATASET_CONFIG = None
 
 

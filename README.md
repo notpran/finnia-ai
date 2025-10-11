@@ -69,7 +69,7 @@ Adjust hyperparameters or add `--sample_size 1000` for faster debugging.
 
 - **OpenAssistant/oasst1** provides human–assistant chat pairs.
 - **gsm8k** contributes math problems; the preprocessing prepends "Let's reason step by step." to encourage chain-of-thought outputs.
-- **fka/CodeAlpaca-20k** supplies coding instructions and completions.
+- **sahil2801/CodeAlpaca-20k** supplies coding instructions and completions.
 
 Datasets are automatically downloaded via the Hugging Face Datasets library and combined into a single dialogue-style corpus with padding/truncation to a fixed length.
 

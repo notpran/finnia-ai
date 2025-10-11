@@ -29,13 +29,17 @@ def _format_dialogue(user: str, assistant: str) -> str:
 
 def _load_chat_dataset(split: str, sample_size: Optional[int] = None) -> Dataset:
     raw = load_dataset(CHAT_DATASET_NAME, split=split, trust_remote_code=True)
-    parents = {row["id"]: row for row in raw}
+
+    id_key = "id" if "id" in raw.column_names else "message_id"
+    parent_key = "parent_id" if "parent_id" in raw.column_names else "parent_message_id"
+
+    parents = {row[id_key]: row for row in raw if row.get(id_key) is not None}
 
     records: List[str] = []
     for row in raw:
         if row.get("role") != "assistant":
             continue
-        parent_id = row.get("parent_id")
+        parent_id = row.get(parent_key)
         if parent_id is None:
             continue
         parent = parents.get(parent_id)

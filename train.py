@@ -87,8 +87,11 @@ def main() -> None:
     supported_params = set(signature(TrainingArguments.__init__).parameters)
     filtered_args = {k: v for k, v in raw_args.items() if k in supported_params}
 
+    eval_strategy = filtered_args.get("evaluation_strategy")
+
     if "evaluation_strategy" not in supported_params:
         filtered_args.pop("evaluation_strategy", None)
+        eval_strategy = None
         if not args.no_eval:
             print("[train.py] Warning: installed transformers version does not support 'evaluation_strategy'; evaluation will be skipped.")
     if "save_strategy" not in supported_params:
@@ -99,6 +102,18 @@ def main() -> None:
         filtered_args.pop("gradient_checkpointing", None)
     if "report_to" not in supported_params:
         filtered_args.pop("report_to", None)
+
+    eval_disabled = args.no_eval or (isinstance(eval_strategy, str) and eval_strategy.lower() == "no") or eval_strategy is None
+    if eval_disabled:
+        filtered_args.pop("load_best_model_at_end", None)
+    else:
+        save_strategy = filtered_args.get("save_strategy")
+        if isinstance(eval_strategy, str) and isinstance(save_strategy, str) and eval_strategy != save_strategy:
+            print(
+                "[train.py] Info: aligning save strategy with evaluation strategy ("
+                f"{save_strategy} -> {eval_strategy})."
+            )
+            filtered_args["save_strategy"] = eval_strategy
 
     training_args = TrainingArguments(**filtered_args)
 

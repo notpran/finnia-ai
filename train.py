@@ -1,147 +1,284 @@
+"""Standalone training script for the mini-GPT model."""
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+import math
 import os
-from dataclasses import asdict
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
 
+import numpy as np
 import torch
-from inspect import signature
+from torch.nn.utils import clip_grad_norm_
+from contextlib import contextmanager
 
-from transformers import DataCollatorForLanguageModeling, Trainer, TrainingArguments
+from torch.utils.data import DataLoader
 
-from data import DataConfig, load_mixed_dataset
-from model import load_model_and_tokenizer
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune GPT-style model for conversational tasks")
-    parser.add_argument("--model_name", default="gpt2", help="Base model to fine-tune")
-    parser.add_argument("--output_dir", default="/content/finetuned-chat-model", help="Directory to save the fine-tuned model")
-    parser.add_argument("--max_length", type=int, default=512, help="Maximum token length for inputs")
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Initial learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--epochs", type=float, default=2.0, help="Number of training epochs")
-    parser.add_argument("--train_batch_size", type=int, default=2, help="Per-device train batch size")
-    parser.add_argument("--eval_batch_size", type=int, default=2, help="Per-device eval batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--warmup_steps", type=int, default=200, help="Number of warmup steps")
-    parser.add_argument("--logging_steps", type=int, default=25, help="Logging frequency in steps")
-    parser.add_argument("--evaluation_strategy", default="epoch", choices=["no", "steps", "epoch"], help="Evaluation strategy")
-    parser.add_argument("--save_strategy", default="epoch", choices=["no", "steps", "epoch"], help="Checkpoint save strategy")
-    parser.add_argument("--sample_size", type=int, default=None, help="Optional cap per dataset for debugging")
-    parser.add_argument("--overwrite_output_dir", action="store_true", help="Overwrite output directory if it exists")
-    parser.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision if available")
-    parser.add_argument("--bf16", action="store_true", help="Use bf16 mixed precision if available")
-    parser.add_argument("--no_eval", action="store_true", help="Skip evaluation after training")
-    return parser.parse_args()
+from config import ProjectConfig, load_default_config
+from datasets import build_dataloader
+from model import build_model
+from tokenizer import load_tokenizer
 
 
-def main() -> None:
-    args = parse_args()
+LOGGER = logging.getLogger("train")
 
-    if args.fp16 and args.bf16:
-        raise ValueError("Only one of --fp16 or --bf16 can be set.")
 
-    fp16 = args.fp16 or (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7)
-    bf16 = args.bf16 or (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    torch_dtype = None
-    if bf16:
-        torch_dtype = torch.bfloat16
-    elif fp16:
-        torch_dtype = torch.float16
 
-    model, tokenizer = load_model_and_tokenizer(
-        args.model_name,
-        torch_dtype=torch_dtype,
-        device_map=None,  # Trainer handles device placement
+class WarmupCosineScheduler:
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int, base_lr: float) -> None:
+        self.optimizer = optimizer
+        self.warmup_steps = max(1, warmup_steps)
+        self.total_steps = max(total_steps, warmup_steps + 1)
+        self.base_lr = base_lr
+        self.last_step = -1
+        self.step()
+
+    def step(self) -> None:
+        self.last_step += 1
+        lr = self.get_lr(self.last_step)
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+    def get_lr(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return self.base_lr * (step + 1) / self.warmup_steps
+        progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        return 0.5 * self.base_lr * (1 + math.cos(math.pi * progress))
+
+    def state_dict(self) -> Dict:
+        return {"last_step": self.last_step}
+
+    def load_state_dict(self, state_dict: Dict) -> None:
+        self.last_step = state_dict.get("last_step", 0)
+        lr = self.get_lr(self.last_step)
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+
+def evaluate(model: torch.nn.Module, dataloader: DataLoader, device: torch.device, max_batches: int) -> Dict[str, float]:
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for step, (inputs, targets) in enumerate(dataloader):
+            if step >= max_batches:
+                break
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            _, loss = model(inputs, targets)
+            losses.append(loss.item())
+    model.train()
+    if not losses:
+        return {"loss": float("nan"), "ppl": float("nan")}
+    mean_loss = sum(losses) / len(losses)
+    return {"loss": mean_loss, "ppl": math.exp(mean_loss)}
+
+
+def sample_outputs(model: torch.nn.Module, tokenizer, device: torch.device, prompts: Dict[str, str], cfg: ProjectConfig) -> Dict[str, str]:
+    outputs = {}
+    for name, text in prompts.items():
+        encoded = tokenizer.encode(text)
+        input_ids = torch.tensor([encoded.ids], dtype=torch.long, device=device)
+        generated = model.generate(
+            input_ids,
+            max_new_tokens=128,
+            temperature=0.8,
+            top_k=50,
+            top_p=0.95,
+        )
+        decoded = tokenizer.decode(generated[0].tolist(), skip_special_tokens=False)
+        outputs[name] = decoded
+    return outputs
+
+
+def save_checkpoint(output_dir: Path, step: int, model, optimizer, scheduler, scaler) -> Path:
+    ckpt_dir = output_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = ckpt_dir / f"model_step_{step}.pt"
+    torch.save(
+        {
+            "step": step,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler else None,
+            "scaler": scaler.state_dict() if scaler else None,
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path
+
+
+def load_checkpoint(path: Path, model, optimizer, scheduler, scaler) -> int:
+    state = torch.load(path, map_location="cpu")
+    model.load_state_dict(state["model"])
+    if optimizer and state.get("optimizer"):
+        optimizer.load_state_dict(state["optimizer"])
+    if scheduler and state.get("scheduler"):
+        scheduler.load_state_dict(state["scheduler"])
+    if scaler and state.get("scaler"):
+        scaler.load_state_dict(state["scaler"])
+    return int(state.get("step", 0))
+
+
+def setup_logging(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / "train.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
     )
 
-    config = DataConfig(max_length=args.max_length, sample_size=args.sample_size)
-    dataset = load_mixed_dataset(tokenizer, config)
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+def get_device(runtime_cfg) -> torch.device:
+    if runtime_cfg.device == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
-    raw_args = {
-        "output_dir": args.output_dir,
-        "overwrite_output_dir": args.overwrite_output_dir,
-        "evaluation_strategy": "no" if args.no_eval else args.evaluation_strategy,
-        "save_strategy": args.save_strategy,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "per_device_train_batch_size": args.train_batch_size,
-        "per_device_eval_batch_size": args.eval_batch_size,
-        "num_train_epochs": args.epochs,
-        "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "warmup_steps": args.warmup_steps,
-        "logging_steps": args.logging_steps,
-        "fp16": fp16 and not bf16,
-        "bf16": bf16,
-        "report_to": ["tensorboard"],
-        "load_best_model_at_end": not args.no_eval,
-        "save_total_limit": 2,
-        "push_to_hub": False,
-        "gradient_checkpointing": True,
+
+def main(args: Optional[argparse.Namespace] = None) -> None:
+    parser = argparse.ArgumentParser(description="Train the mini-GPT model from scratch.")
+    parser.add_argument("--config-json", default=None, help="Path to JSON file with config overrides.")
+    parser.add_argument("--output-dir", default=None, help="Override output directory.")
+    parser.add_argument("--resume", default=None, help="Checkpoint path to resume from.")
+    cli_args = parser.parse_args(args=args)
+
+    cfg = load_default_config()
+    if cli_args.config_json:
+        overrides = json.loads(Path(cli_args.config_json).read_text())
+        cfg = cfg.override(**overrides)
+    if cli_args.output_dir:
+        cfg.runtime.output_dir = cli_args.output_dir
+    if cli_args.resume:
+        cfg.training.resume_from = cli_args.resume
+
+    output_dir = Path(cfg.runtime.output_dir)
+    setup_logging(output_dir)
+    LOGGER.info("Starting run with config: %s", cfg)
+    set_seed(cfg.runtime.seed)
+
+    device = get_device(cfg.runtime)
+    tokenizer = load_tokenizer(cfg.data.tokenizer_path)
+    vocab_size = tokenizer.get_vocab_size()
+    cfg.model.vocab_size = vocab_size
+
+    model = build_model(cfg.model).to(device)
+    if cfg.runtime.use_compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+
+    train_loader = build_dataloader(tokenizer, cfg.data, cfg.training, split="train")
+    eval_loader = build_dataloader(tokenizer, cfg.data, cfg.training, split="eval")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler = WarmupCosineScheduler(optimizer, cfg.training.warmup_steps, cfg.training.total_steps, cfg.training.learning_rate)
+
+    scaler = None
+    amp_dtype = torch.float32
+    if cfg.training.mixed_precision == "fp16":
+        amp_dtype = torch.float16
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+    elif cfg.training.mixed_precision == "bf16":
+        amp_dtype = torch.bfloat16
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+
+    start_step = 0
+    if cfg.training.resume_from:
+        ckpt_path = Path(cfg.training.resume_from)
+        if ckpt_path.exists():
+            LOGGER.info("Resuming from checkpoint %s", ckpt_path)
+            start_step = load_checkpoint(ckpt_path, model, optimizer, scheduler, scaler)
+
+    total_steps = cfg.training.total_steps
+    grad_accum = cfg.training.grad_accum_steps
+    model.train()
+
+    prompts = {
+        "chat": "User: Hello! How are you today?\nAssistant:",
+        "math": "User: Solve: 12 + 35\nAssistant:",
+        "code": "User: Write a JavaScript function that reverses a string.\nAssistant:",
     }
 
-    supported_params = set(signature(TrainingArguments.__init__).parameters)
-    filtered_args = {k: v for k, v in raw_args.items() if k in supported_params}
-
-    eval_strategy = filtered_args.get("evaluation_strategy")
-
-    if "evaluation_strategy" not in supported_params:
-        filtered_args.pop("evaluation_strategy", None)
-        eval_strategy = None
-        if not args.no_eval:
-            print("[train.py] Warning: installed transformers version does not support 'evaluation_strategy'; evaluation will be skipped.")
-    if "save_strategy" not in supported_params:
-        filtered_args.pop("save_strategy", None)
-    if "load_best_model_at_end" not in supported_params:
-        filtered_args.pop("load_best_model_at_end", None)
-    if "gradient_checkpointing" not in supported_params:
-        filtered_args.pop("gradient_checkpointing", None)
-    if "report_to" not in supported_params:
-        filtered_args.pop("report_to", None)
-
-    eval_disabled = args.no_eval or (isinstance(eval_strategy, str) and eval_strategy.lower() == "no") or eval_strategy is None
-    if eval_disabled:
-        filtered_args.pop("load_best_model_at_end", None)
+    if device.type == "cuda":
+        scaler_context = torch.cuda.amp.autocast  # type: ignore[attr-defined]
     else:
-        save_strategy = filtered_args.get("save_strategy")
-        if isinstance(eval_strategy, str) and isinstance(save_strategy, str) and eval_strategy != save_strategy:
-            print(
-                "[train.py] Info: aligning save strategy with evaluation strategy ("
-                f"{save_strategy} -> {eval_strategy})."
+        @contextmanager
+        def scaler_context(**_kwargs):
+            yield
+
+    global_step = start_step
+    dataloader_iter = iter(train_loader)
+
+    while global_step < total_steps:
+        optimizer.zero_grad(set_to_none=True)
+        accumulated_loss = 0.0
+        for accum_step in range(grad_accum):
+            try:
+                inputs, targets = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(train_loader)
+                inputs, targets = next(dataloader_iter)
+
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            with scaler_context(dtype=amp_dtype):
+                _, loss = model(inputs, targets)
+                loss = loss / grad_accum
+            accumulated_loss += loss.item()
+
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+        if cfg.training.max_grad_norm:
+            if scaler:
+                scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
+
+        if scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        scheduler.step()
+
+        global_step += 1
+
+        if global_step % cfg.training.log_interval == 0:
+            LOGGER.info(
+                "Step %d | loss %.4f | lr %.6f",
+                global_step,
+                accumulated_loss,
+                optimizer.param_groups[0]["lr"],
             )
-            filtered_args["save_strategy"] = eval_strategy
 
-    training_args = TrainingArguments(**filtered_args)
+        if global_step % cfg.training.eval_interval == 0:
+            metrics = evaluate(model, eval_loader, device, cfg.eval.max_eval_batches)
+            LOGGER.info("Eval @ step %d | loss %.4f | ppl %.2f", global_step, metrics["loss"], metrics["ppl"])
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset["train"],
-        eval_dataset=None if args.no_eval else dataset["validation"],
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-    )
+        if global_step % cfg.training.sample_interval == 0:
+            samples = sample_outputs(model, tokenizer, device, prompts, cfg)
+            sample_path = output_dir / f"samples_step_{global_step}.txt"
+            with sample_path.open("w") as f:
+                for name, text in samples.items():
+                    f.write(f"### {name}\n{text}\n\n")
 
-    trainer.train()
+        if global_step % cfg.training.checkpoint_interval == 0:
+            ckpt_path = save_checkpoint(output_dir, global_step, model, optimizer, scheduler, scaler)
+            LOGGER.info("Saved checkpoint to %s", ckpt_path)
 
-    if not args.no_eval:
-        metrics = trainer.evaluate()
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-
-    # Save data config for reproducibility.
-    with open(os.path.join(args.output_dir, "data_config.json"), "w", encoding="utf-8") as f:
-        import json
-
-        json.dump(asdict(config), f, indent=2)
+    final_ckpt = save_checkpoint(output_dir, global_step, model, optimizer, scheduler, scaler)
+    LOGGER.info("Training complete at step %d (final checkpoint: %s)", global_step, final_ckpt)
 
 
 if __name__ == "__main__":

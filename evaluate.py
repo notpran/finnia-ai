@@ -1,87 +1,83 @@
+"""Evaluation script for the mini-GPT model."""
 from __future__ import annotations
 
 import argparse
-from textwrap import dedent
-from typing import List
+from pathlib import Path
+from typing import Dict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from config import load_default_config
+from datasets import build_dataloader
+from model import build_model
+from tokenizer import load_tokenizer
 
 
-SAMPLE_PROMPTS: List[str] = [
-    "User: What are the three laws of motion?\nAssistant:",
-    dedent(
-        """User: Solve 24x + 13 = 85. Show each step.\nAssistant:"""
-    ).strip(),
-    dedent(
-        """User: Write a JavaScript function called sumArray(arr) that returns the sum of an array. Explain the code.\nAssistant:"""
-    ).strip(),
-]
+PROMPTS = {
+    "english": "Once upon a time,",
+    "math": "Solve: (3x + 5 = 11)",
+    "javascript": "Write a function add(a, b) {",
+}
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate the fine-tuned chatbot on sample prompts")
-    parser.add_argument(
-        "--model_dir",
-        default="/content/finetuned-chat-model",
-        help="Directory containing the fine-tuned model and tokenizer",
-    )
-    parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum tokens to generate per prompt")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling threshold")
-    return parser.parse_args()
-
-
-def generate_responses(
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
-    prompts: List[str],
-    device: torch.device,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-) -> List[str]:
-    responses: List[str] = []
-    for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+def generate_prompt_outputs(model, tokenizer, device: torch.device) -> Dict[str, str]:
+    model.eval()
+    outputs = {}
+    for name, prompt in PROMPTS.items():
+        encoding = tokenizer.encode(f"User: {prompt}\nAssistant:")
+        input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=device)
         with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
+            generated = model.generate(
+                input_ids,
+                max_new_tokens=128,
+                temperature=0.8,
+                top_k=50,
+                top_p=0.95,
             )
-        decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        responses.append(decoded[len(prompt) :].strip())
-    return responses
+        decoded = tokenizer.decode(generated[0].tolist(), skip_special_tokens=False)
+        outputs[name] = decoded
+    return outputs
+
+
+def compute_perplexity(model, dataloader, device: torch.device, max_batches: int) -> float:
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for idx, (inputs, targets) in enumerate(dataloader):
+            if idx >= max_batches:
+                break
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            _, loss = model(inputs, targets)
+            losses.append(loss.item())
+    if not losses:
+        return float("nan")
+    mean_loss = sum(losses) / len(losses)
+    return float(torch.exp(torch.tensor(mean_loss)).item())
 
 
 def main() -> None:
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Evaluate a trained mini-GPT model.")
+    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint .pt file.")
+    parser.add_argument("--max-eval-batches", type=int, default=50)
+    args = parser.parse_args()
+
+    cfg = load_default_config()
+    tokenizer = load_tokenizer(cfg.data.tokenizer_path)
+    cfg.model.vocab_size = tokenizer.get_vocab_size()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir).to(device)
-    model.eval()
+    model = build_model(cfg.model, checkpoint_path=args.checkpoint, map_location=device)
+    model.to(device)
 
-    responses = generate_responses(
-        tokenizer,
-        model,
-        SAMPLE_PROMPTS,
-        device,
-        args.max_new_tokens,
-        args.temperature,
-        args.top_p,
-    )
+    dataloader = build_dataloader(tokenizer, cfg.data, cfg.training, split="eval")
+    perplexity = compute_perplexity(model, dataloader, device, args.max_eval_batches)
 
-    for prompt, response in zip(SAMPLE_PROMPTS, responses):
-        print("=" * 40)
-        print(prompt)
-        print("Assistant:")
-        print(response)
-        print()
+    outputs = generate_prompt_outputs(model, tokenizer, device)
+    print("=== Prompt Outputs ===")
+    for name, text in outputs.items():
+        print(f"[{name}]\n{text}\n")
+    print(f"Perplexity (approx): {perplexity:.3f}")
 
 
 if __name__ == "__main__":

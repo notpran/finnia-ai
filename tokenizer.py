@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 from typing import Iterable, List
 
-from datasets import load_dataset
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 
 from config import load_default_config
@@ -17,8 +16,15 @@ SPECIAL_TOKENS = ["<|pad|>", "<|bos|>", "<|eos|>", "<|unk|>"]
 
 
 def iter_training_texts(sources: List[str], limit_per_source: int | None = None) -> Iterable[str]:
+    # Import inside function to avoid circular import when other local modules
+    # also import HF `datasets` as `hf_datasets`.
+    from datasets import load_dataset as hf_load_dataset
+
     for source in sources:
-        dataset = load_dataset(source, split="train")
+        try:
+            dataset = hf_load_dataset(source, split="train")
+        except Exception:
+            continue
         count = 0
         for row in dataset:
             text = None

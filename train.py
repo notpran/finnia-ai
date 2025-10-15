@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from torch.utils.data import DataLoader
 
 from config import ProjectConfig, load_default_config
-from datasets import build_dataloader
+from data import build_dataloader
 from model import build_model
 from tokenizer import load_tokenizer
 

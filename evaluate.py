@@ -8,7 +8,7 @@ from typing import Dict
 import torch
 
 from config import load_default_config
-from datasets import build_dataloader
+from data import build_dataloader
 from model import build_model
 from tokenizer import load_tokenizer
 

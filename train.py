@@ -150,6 +150,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     parser.add_argument("--config-json", default=None, help="Path to JSON file with config overrides.")
     parser.add_argument("--output-dir", default=None, help="Override output directory.")
     parser.add_argument("--resume", default=None, help="Checkpoint path to resume from.")
+    parser.add_argument("--total-steps", type=int, default=None, help="Override total training steps from config.")
     cli_args = parser.parse_args(args=args)
 
     cfg = load_default_config()
@@ -160,6 +161,8 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         cfg.runtime.output_dir = cli_args.output_dir
     if cli_args.resume:
         cfg.training.resume_from = cli_args.resume
+    if getattr(cli_args, "total_steps", None):
+        cfg.training.total_steps = int(cli_args.total_steps)
 
     output_dir = Path(cfg.runtime.output_dir)
     setup_logging(output_dir)

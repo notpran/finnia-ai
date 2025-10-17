@@ -122,8 +122,15 @@ class MiniGPT(nn.Module):
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / max(temperature, 1e-5)
             if top_k is not None:
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float("inf")
+                # Clamp top_k to vocab size to avoid runtime errors when top_k > V.
+                V = logits.size(-1)
+                k = min(max(0, int(top_k)), V)
+                if k == 0:
+                    # no truncation
+                    pass
+                else:
+                    v, _ = torch.topk(logits, k)
+                    logits[logits < v[:, [-1]]] = -float("inf")
             if top_p is not None:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)

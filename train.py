@@ -309,4 +309,5 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     LOGGER.info("Training complete at step %d (final checkpoint: %s)", global_step, final_ckpt)
 
 
-main()
+if __name__ == "__main__":
+    main()

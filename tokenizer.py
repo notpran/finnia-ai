@@ -85,4 +85,6 @@ def cli() -> None:
     tokenizer = train_tokenizer(output_path=output_path, vocab_size=args.vocab_size, sample_sources=args.sources, limit_per_source=args.limit)
     print(f"Saved tokenizer to {output_path} (vocab {tokenizer.get_vocab_size()}).")
 
-cli()
+
+if __name__ == "__main__":
+    cli()

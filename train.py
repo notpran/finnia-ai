@@ -15,6 +15,10 @@ import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 from contextlib import contextmanager
+import time
+import shutil
+import tempfile
+import errno
 
 from torch.utils.data import DataLoader
 
@@ -104,17 +108,71 @@ def save_checkpoint(output_dir: Path, step: int, model, optimizer, scheduler, sc
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = ckpt_dir / f"model_step_{step}.pt"
-    torch.save(
-        {
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler else None,
-            "scaler": scaler.state_dict() if scaler else None,
-        },
-        checkpoint_path,
-    )
-    return checkpoint_path
+
+    payload = {
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler else None,
+        "scaler": scaler.state_dict() if scaler else None,
+    }
+
+    # Try atomic save with retries. If the primary FS fails (disk full, broken pipe),
+    # fall back to writing the checkpoint into /tmp and then move it into place.
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Write to a temp file in the same directory for atomic replace
+            with tempfile.NamedTemporaryFile(prefix=f"tmp_ckpt_{step}_", dir=str(ckpt_dir), delete=False) as tf:
+                tmp_path = Path(tf.name)
+                # Use torch.save to write into the temp file path
+                torch.save(payload, tmp_path)
+                tf.flush()
+                try:
+                    os.fsync(tf.fileno())
+                except OSError:
+                    # fsync may not be supported on some filesystems; ignore but log
+                    LOGGER.debug("fsync failed on %s (ignored)", tmp_path)
+
+            # Move into final location atomically
+            shutil.move(str(tmp_path), str(checkpoint_path))
+            LOGGER.info("Checkpoint saved to %s", checkpoint_path)
+            return checkpoint_path
+
+        except (OSError, RuntimeError) as exc:
+            # Cleanup tmp file if it exists
+            try:
+                if 'tmp_path' in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+            # If disk full or write error, try fallback to /tmp
+            is_transient = isinstance(exc, (OSError, RuntimeError))
+            LOGGER.warning("Attempt %d/%d: failed saving checkpoint to %s: %s", attempt, max_retries, checkpoint_path, exc)
+
+            # If last attempt, try /tmp fallback
+            if attempt == max_retries:
+                try:
+                    fallback_dir = Path(tempfile.gettempdir()) / "finnia_checkpoints"
+                    fallback_dir.mkdir(parents=True, exist_ok=True)
+                    fallback_tmp = fallback_dir / f"model_step_{step}.pt"
+                    torch.save(payload, fallback_tmp)
+                    # Try to move into final location if possible
+                    try:
+                        shutil.move(str(fallback_tmp), str(checkpoint_path))
+                        LOGGER.info("Checkpoint saved via fallback to %s", checkpoint_path)
+                        return checkpoint_path
+                    except Exception:
+                        LOGGER.warning("Could not move fallback checkpoint into place; leaving at %s", fallback_tmp)
+                        return fallback_tmp
+                except Exception as fallback_exc:
+                    LOGGER.error("Fallback save also failed: %s", fallback_exc)
+                    raise
+
+            # Backoff before retrying
+            time.sleep(1.0 * attempt)
+
 
 
 def load_checkpoint(path: Path, model, optimizer, scheduler, scaler) -> int:

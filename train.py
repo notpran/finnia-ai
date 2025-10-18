@@ -151,6 +151,10 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     parser.add_argument("--output-dir", default=None, help="Override output directory.")
     parser.add_argument("--resume", default=None, help="Checkpoint path to resume from.")
     parser.add_argument("--total-steps", type=int, default=None, help="Override total training steps from config.")
+    parser.add_argument("--checkpoint-interval", type=int, default=None, help="Override checkpoint interval (global steps). Default set to 50 if not provided.")
+    parser.add_argument("--batch-size-per-gpu", type=int, default=None, help="Override batch size per GPU (micro-batch size).")
+    parser.add_argument("--grad-accum-steps", type=int, default=None, help="Override gradient accumulation steps.")
+    parser.add_argument("--cudnn-benchmark", action="store_true", help="Enable torch.backends.cudnn.benchmark for potential speedups.")
     cli_args = parser.parse_args(args=args)
 
     cfg = load_default_config()
@@ -163,6 +167,24 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         cfg.training.resume_from = cli_args.resume
     if getattr(cli_args, "total_steps", None):
         cfg.training.total_steps = int(cli_args.total_steps)
+    # Set checkpoint interval default to 50 unless explicitly overridden
+    if getattr(cli_args, "checkpoint_interval", None) is not None:
+        cfg.training.checkpoint_interval = int(cli_args.checkpoint_interval)
+    else:
+        cfg.training.checkpoint_interval = 50
+    if getattr(cli_args, "batch_size_per_gpu", None):
+        cfg.training.batch_size_per_gpu = int(cli_args.batch_size_per_gpu)
+    if getattr(cli_args, "grad_accum_steps", None):
+        cfg.training.grad_accum_steps = int(cli_args.grad_accum_steps)
+    if getattr(cli_args, "cudnn_benchmark", False):
+        try:
+            import torch.backends.cudnn as cudnn
+
+            cudnn.benchmark = True
+            cudnn.enabled = True
+            LOGGER.info("Enabled cudnn.benchmark for potential speedup")
+        except Exception:
+            LOGGER.info("Could not enable cudnn benchmark")
 
     output_dir = Path(cfg.runtime.output_dir)
     setup_logging(output_dir)
@@ -177,6 +199,9 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     model = build_model(cfg.model).to(device)
     if cfg.runtime.use_compile and hasattr(torch, "compile"):
         model = torch.compile(model)
+
+    LOGGER.info("Using batch_size_per_gpu=%d, grad_accum_steps=%d, effective_batch=%d", cfg.training.batch_size_per_gpu, cfg.training.grad_accum_steps, cfg.training.batch_size_per_gpu * max(1, cfg.training.grad_accum_steps))
+    LOGGER.info("Checkpoint interval set to %d steps", cfg.training.checkpoint_interval)
 
     train_loader = build_dataloader(tokenizer, cfg.data, cfg.training, split="train")
     eval_loader = build_dataloader(tokenizer, cfg.data, cfg.training, split="eval")
@@ -284,5 +309,4 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     LOGGER.info("Training complete at step %d (final checkpoint: %s)", global_step, final_ckpt)
 
 
-if __name__ == "__main__":
-    main()
+main()

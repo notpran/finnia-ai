@@ -15,8 +15,8 @@ from tokenizer import load_tokenizer
 
 PROMPTS = {
     "english": "Once upon a time,",
-    "math": "Solve: (3x + 5 = 11)",
-    "javascript": "Write a function add(a, b) {",
+    "math": "Solve: (4x = 16)",
+    "javascript": "Make a http request using fetch in JavaScript.",
 }
 
 
@@ -80,5 +80,4 @@ def main() -> None:
     print(f"Perplexity (approx): {perplexity:.3f}")
 
 
-if __name__ == "__main__":
-    main()
+main()

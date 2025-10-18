@@ -56,5 +56,4 @@ def main() -> None:
     chat_loop(model, tokenizer, device, args.max_new_tokens, args.temperature, args.top_k, args.top_p)
 
 
-if __name__ == "__main__":
-    main()
+main()
